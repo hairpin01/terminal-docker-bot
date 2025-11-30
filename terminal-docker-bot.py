@@ -1,0 +1,1760 @@
+import asyncio
+import docker
+import signal
+import sys
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    CallbackContext,
+    CallbackQueryHandler,
+    ConversationHandler,
+    InlineQueryHandler )
+
+import redis
+import logging
+import os
+import json
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+import psutil
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('bot.log')
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+# Состояния для ConversationHandler
+SELECTING_IMAGE, SELECTING_SHELL, SELECTING_TTL, SELECTING_CONFIG, CUSTOM_IMAGE, CONFIRMING_USER = range(6)
+
+class TerminalBot:
+    def __init__(self):
+        try:
+            self.docker_client = docker.from_env()
+            logger.info("Docker client initialized successfully")
+            self.cleanup_old_containers()
+            self.cleanup_old_sessions()  # Добавьте эту строку
+            self.setup_signal_handlers()
+        except Exception as e:
+            logger.error(f"Failed to initialize Docker client: {e}")
+            sys.exit(1)
+
+        self.redis = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+
+        # Администраторы
+        self.admin_ids = [6020965582]  # Замените на ваши ID
+
+        # Подтвержденные пользователи
+        self.init_confirmed_users()
+
+        # Правильные имена образов Docker
+        self.available_images = {
+            "alpine:latest": "Alpine Linux",
+            "ubuntu:latest": "Ubuntu",
+            "debian:latest": "Debian",
+            "kalilinux/kali-rolling": "Kali Linux",
+            "opensuse/leap:latest": "openSUSE",
+            "fedora:latest": "Fedora",
+            "archlinux:latest": "Arch Linux"
+        }
+
+        # Шеллы
+        self.available_shells = ["bash", "sh"]
+
+        # Время жизни контейнеров
+        self.ttl_options = {
+            "30m": 1800,
+            "1h": 3600,
+            "5h": 18000,
+            "24h": 86400,
+            "7d": 604800,
+            "12d": 1036800,
+            "always": None
+        }
+
+        # Конфигурации ресурсов
+        self.resource_configs = {
+            "minimal": {
+                "name": "Минимальная",
+                "cpu_period": 100000,
+                "cpu_quota": 25000,  # 25% CPU
+                "mem_limit": "128m",
+                "pids_limit": 20,
+                "description": "128MB RAM, 25% CPU"
+            },
+            "medium": {
+                "name": "Средняя",
+                "cpu_period": 100000,
+                "cpu_quota": 50000,  # 50% CPU
+                "mem_limit": "128m",
+                "pids_limit": 50,
+                "description": "128MB RAM, 50% CPU"
+            },
+            "enhanced": {
+                "name": "Улучшенная",
+                "cpu_period": 100000,
+                "cpu_quota": 75000,  # 75% CPU
+                "mem_limit": "256m",
+                "pids_limit": 100,
+                "description": "256MB RAM, 75% CPU"
+            },
+            "maximum": {
+                "name": "Максимальная",
+                "cpu_period": 100000,
+                "cpu_quota": 100000,  # 100% CPU
+                "mem_limit": "512m",
+                "pids_limit": 200,
+                "description": "512MB RAM, 100% CPU"
+            }
+        }
+
+        # Очереди команд для каждого пользователя
+        self.command_queues = {}
+        self.command_workers = {}
+        self.active_commands = {}  # Для отслеживания активных команд
+
+        # Пул потоков для выполнения команд
+        self.thread_pool = ThreadPoolExecutor(max_workers=10)
+
+    def init_confirmed_users(self):
+        """Инициализирует список подтвержденных пользователей"""
+        if not self.redis.exists("confirmed_users"):
+            for admin_id in self.admin_ids:
+                self.redis.sadd("confirmed_users", admin_id)
+            logger.info(f"Initialized confirmed users with admin IDs: {self.admin_ids}")
+
+    def is_admin(self, user_id):
+        """Проверяет, является ли пользователь администратором"""
+        return str(user_id) in [str(admin_id) for admin_id in self.admin_ids]
+
+    def is_confirmed_user(self, user_id):
+        """Проверяет, является ли пользователь подтвержденным"""
+        return self.redis.sismember("confirmed_users", str(user_id))
+
+    def add_confirmed_user(self, user_id):
+        """Добавляет пользователя в подтвержденные"""
+        self.redis.sadd("confirmed_users", str(user_id))
+        logger.info(f"Added user {user_id} to confirmed users")
+
+    def has_active_session(self, user_id):
+        """Проверяет, есть ли у пользователя активная сессия"""
+        session_key = f"session:{user_id}"
+        return self.redis.exists(session_key)
+
+    def get_session_info(self, user_id):
+        """Получает информацию о сессии пользователя"""
+        session_key = f"session:{user_id}"
+        session_data = self.redis.get(session_key)
+        if session_data:
+            return json.loads(session_data)
+        return None
+
+    def setup_signal_handlers(self):
+        """Настраивает обработчики сигналов для graceful shutdown"""
+        def signal_handler(signum, frame):
+            logger.info(f"Получен сигнал {signum}, завершаем работу...")
+            self.cleanup_all_containers()
+            # Останавливаем все воркеры
+            for user_id, worker in self.command_workers.items():
+                worker.cancel()
+            self.thread_pool.shutdown(wait=False)
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+    def cleanup_old_containers(self):
+        """Очищает старые контейнеры бота при запуске"""
+        try:
+            containers = self.docker_client.containers.list(
+                all=True,
+                filters={"name": "terminal_bot_"}
+            )
+            logger.info(f"Found {len(containers)} old containers to clean up")
+            for container in containers:
+                try:
+                    logger.info(f"Останавливаем контейнер: {container.name} (ID: {container.id})")
+                    container.stop(timeout=1)
+                    container.remove()
+                    logger.info(f"Удален старый контейнер: {container.name}")
+                except Exception as e:
+                    logger.error(f"Ошибка при удалении контейнера {container.name}: {e}")
+        except Exception as e:
+            logger.error(f"Ошибка при очистке контейнеров: {e}")
+
+    def cleanup_all_containers(self):
+        """Останавливает и удаляет все контейнеры бота"""
+        try:
+            containers = self.docker_client.containers.list(
+                filters={"name": "terminal_bot_"}
+            )
+            logger.info(f"Cleaning up {len(containers)} active containers")
+            for container in containers:
+                try:
+                    container.stop(timeout=1)
+                    container.remove()
+                    logger.info(f"Остановлен и удален контейнер: {container.name}")
+                except Exception as e:
+                    logger.error(f"Ошибка при удалении контейнера {container.name}: {e}")
+        except Exception as e:
+            logger.error(f"Ошибка при очистке контейнеров: {e}")
+    async def nohup_command(self, update: Update, context: CallbackContext):
+        """Выполняет команду в фоне без ожидания завершения"""
+        user_id = update.effective_user.id
+
+        # Проверяем, есть ли активная сессия
+        if not self.has_active_session(user_id):
+            await update.message.reply_text(
+                "❌ У вас нет активного контейнера. Используйте /container для создания нового."
+            )
+            return
+
+        # Проверяем аргументы команды
+        if not context.args:
+            await update.message.reply_text(
+                "Использование: /nohup <команда>\n\n"
+                "Примеры:\n"
+                "/nohup python -m http.server 8080\n"
+                "/nohup node server.js\n"
+                "/nohup ./start.sh"
+            )
+            return
+
+        command = ' '.join(context.args)
+
+        # Проверка безопасности для неподтвержденных пользователей
+        if not self.is_confirmed_user(user_id) and await self.is_command_dangerous(command):
+            await update.message.reply_text("❌ Команда запрещена для выполнения")
+            return
+
+        # Получаем информацию о сессии
+        session_info = self.get_session_info(user_id)
+        container_id = session_info.get('container_id')
+        shell = session_info.get('shell', 'bash')
+
+        if not container_id:
+            await update.message.reply_text("❌ Ошибка: ID контейнера не найден")
+            return
+
+        try:
+            container = self.docker_client.containers.get(container_id)
+        except:
+            await update.message.reply_text("❌ Контейнер не найден. Используйте /container для создания нового.")
+            self.redis.delete(f"session:{user_id}")
+            return
+
+        # Создаем уникальное имя для лог-файла
+        import time
+        log_file = f"/tmp/nohup_{user_id}_{int(time.time())}.log"
+
+        # Формируем команду для выполнения в фоне
+        background_command = f"nohup {shell} -c \"{command}\" > {log_file} 2>&1 & echo $! > /tmp/last_pid_{user_id}.txt"
+
+        # Выполняем команду запуска в фоне
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(
+                self.thread_pool,
+                self._run_command_sync,
+                container,
+                background_command
+            )
+
+            output, exit_code = result
+
+            if exit_code == 0:
+                # Получаем PID запущенного процесса
+                pid_result = await loop.run_in_executor(
+                    self.thread_pool,
+                    self._run_command_sync,
+                    container,
+                    f"cat /tmp/last_pid_{user_id}.txt"
+                )
+
+                pid = pid_result[0].strip() if pid_result[0] else "неизвестен"
+
+                await update.message.reply_text(
+                    f"✅ Команда запущена в фоне!\n\n"
+                    f"📝 Команда: `{command}`\n"
+                    f"🆔 PID: `{pid}`\n"
+                    f"📁 Логи: `{log_file}`\n\n"
+                    f"💡 Для проверки процессов используйте: `ps aux | grep {pid}`\n"
+                    f"📋 Для просмотра логов: `tail -f {log_file}`",
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ Ошибка при запуске команды в фоне:\n```\n{output}\n```",
+                    parse_mode='Markdown'
+                )
+
+        except Exception as e:
+            logger.error(f"Error executing nohup command for user {user_id}: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+
+    async def background_processes(self, update: Update, context: CallbackContext):
+        """Показывает запущенные фоновые процессы"""
+        user_id = update.effective_user.id
+
+        if not self.has_active_session(user_id):
+            await update.message.reply_text("❌ У вас нет активного  контейнера")
+            return
+
+        session_info = self.get_session_info(user_id)
+        container_id = session_info.get('container_id')
+
+        try:
+            container = self.docker_client.containers.get(container_id)
+
+            # Получаем список процессов
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                self.thread_pool,
+                self._run_command_sync,
+                container,
+                "ps aux --sort=-%cpu | head -20"
+            )
+
+            output, exit_code = result
+
+            if exit_code == 0:
+                await update.message.reply_text(
+                    f"📊 Запущенные процессы (топ-20 по CPU):\n```\n{output}\n```",
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text("❌ Ошибка при получении списка процессов")
+
+        except Exception as e:
+            logger.error(f"Error getting processes for user {user_id}: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+    async def kill_process(self, update: Update, context: CallbackContext):
+        """Останавливает процесс по PID"""
+        user_id = update.effective_user.id
+
+        if not context.args:
+            await update.message.reply_text("Использование: /kill       <PID>")
+            return
+
+        pid = context.args[0]
+
+        if not pid.isdigit():
+            await update.message.reply_text("❌ PID должен быть числом")
+            return
+
+        if not self.has_active_session(user_id):
+            await update.message.reply_text("❌ У вас нет активного контейнера")
+            return
+
+        session_info = self.get_session_info(user_id)
+        container_id = session_info.get('container_id')
+
+        try:
+            container = self.docker_client.containers.get(container_id)
+
+            # Останавливаем процесс
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                self.thread_pool,
+                self._run_command_sync,
+                container,
+                f"kill {pid}"
+            )
+
+            output, exit_code = result
+
+            if exit_code == 0:
+                await update.message.reply_text(f"✅ Процесс {pid} остановлен")
+            else:
+                await update.message.reply_text(
+                    f"❌ Ошибка при остановке процесса {pid}:    \n```\n{output}\n```",
+                    parse_mode='Markdown'
+                )
+
+        except Exception as e:
+            logger.error(f"Error killing process {pid} for user {user_id}: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+
+
+    async def check_callback_access(self, update: Update, context: CallbackContext, user_id: int = None) -> bool:
+        """Проверяет, имеет ли пользователь доступ к этому callback"""
+        query = update.callback_query
+        if user_id is None:
+            user_id = query.from_user.id
+
+        # Получаем user_id из callback_data если есть
+        callback_data = query.data
+        if ':' in callback_data:
+            try:
+                parts = callback_data.split(':')
+                if len(parts) >= 2:
+                    target_user_id = int(parts[-1])
+                    if user_id != target_user_id:
+                        await query.answer("❌ Это меню не для вас!", show_alert=True)
+                        return False
+            except:
+                pass
+
+        return True
+
+    async def start(self, update: Update, context: CallbackContext):
+        """Обработчик команды /start"""
+        user_id = update.effective_user.id
+        username = update.effective_user.username or update.effective_user.first_name
+
+        logger.info(f"User {user_id} ({username}) started the bot")
+
+        await update.message.reply_text(
+            "Привет! 👋\n\n"
+            "Я - Docker Terminal Bot, твой личный терминал в Telegram!\n\n"
+            "✨ Что я умею:\n"
+            "• Запускать изолированные Docker-контейнеры\n"
+            "• Выполнять команды в реальном времени\n"
+            "• Работать с разными ОС и шеллами\n"
+            "• Ограничивать ресурсы для безопасности\n\n"
+            "🚀 Чтобы запустить свой первый контейнер, пропиши: /container\n\n"
+            "💡 Подсказка: Используй /docker <команда> в группах для выполнения команд!"
+        )
+
+    async def container_command(self, update: Update, context: CallbackContext):
+        """Обработчик команды /container - показывает главное меню"""
+        user_id = update.effective_user.id
+        await self.show_main_menu(update, context, user_id)
+
+    async def show_main_menu(self, update: Update, context: CallbackContext, user_id: int):
+        """Показывает главное меню"""
+        has_session = self.has_active_session(user_id)
+
+        if has_session:
+            session_info = self.get_session_info(user_id)
+            image_name = self.available_images.get(session_info.get('image', ''), session_info.get('image', 'Кастомный'))
+            shell = session_info.get('shell', 'bash')
+            ttl = session_info.get('ttl_display', 'Неизвестно')
+            config_name = session_info.get('config_name', 'Минимальная')
+            network = "включена" if session_info.get('network', True) else "выключена"
+
+            keyboard = [
+                [InlineKeyboardButton("🔄 Пересоздать конвейер", callback_data=f"launch:{user_id}")],
+                [InlineKeyboardButton("⏹️ Остановить конвейер", callback_data=f"stop:{user_id}")],
+                [InlineKeyboardButton("📊 Состояние конвейера", callback_data=f"status:{user_id}")],
+                [InlineKeyboardButton("ℹ️ Информация", callback_data=f"info:{user_id}")]
+            ]
+
+            text = (f"🔧 Главное меню терминал бота\n\n"
+                   f"✅ Активный конвейер:\n"
+                   f"🐧 Образ: {image_name}\n"
+                   f"💻 Шелл: {shell}\n"
+                   f"⚙️ Конфигурация: {config_name}\n"
+                   f"🌐 Сеть: {network}\n"
+                   f"⏰ Время жизни: {ttl}\n\n"
+                   f"Выберите действие:")
+        else:
+            keyboard = [
+                [InlineKeyboardButton("🚀 Запустить конвейер", callback_data=f"launch:{user_id}")],
+                [InlineKeyboardButton("ℹ️ Информация", callback_data=f"info:{user_id}")]
+            ]
+
+            text = "🔧 Главное меню терминал бота\n\nВыберите действие:"
+
+        if self.is_admin(user_id):
+            keyboard.append([InlineKeyboardButton("👑 Админ панель", callback_data=f"admin:{user_id}")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        # Проверяем тип update и соответствующим образом отправляем сообщение
+        if hasattr(update, 'callback_query') and update.callback_query:
+            # Это callback query - редактируем существующее сообщение
+            await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+        elif hasattr(update, 'message') and update.message:
+            # Это обычное сообщение - отправляем новое
+            await update.message.reply_text(text, reply_markup=reply_markup)
+        else:
+            # Fallback - отправляем через context
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup)
+
+    async def handle_callback(self, update: Update, context: CallbackContext):
+        """Универсальный обработчик callback"""
+        query = update.callback_query
+        await query.answer()
+
+        callback_data = query.data
+        user_id = query.from_user.id
+
+        if not await self.check_callback_access(update, context, user_id):
+            return
+
+        # Разбираем callback_data
+        parts = callback_data.split(':')
+        action = parts[0]
+        target_user_id = int(parts[1]) if len(parts) > 1 else user_id
+
+        if action == "main":
+            await self.show_main_menu(update, context, user_id)
+        elif action == "launch":
+            await self.launch_menu(update, context)
+        elif action == "stop":
+            await self.stop_session(update, context)
+        elif action == "status":
+            await self.container_status(update, context)
+        elif action == "info":
+            await self.information_menu(update, context)
+        elif action == "admin":
+            await self.admin_menu(update, context)
+        elif action == "image":
+            image_key = parts[2]
+            await self.select_image(update, context, image_key)
+        elif action == "shell":
+            shell = parts[2]
+            await self.select_shell(update, context, shell)
+        elif action == "config":
+            config_key = parts[2]
+            await self.select_config(update, context, config_key)
+        elif action == "network":
+            network_state = parts[2] == "true"
+            await self.toggle_network(update, context, network_state)
+        elif action == "ttl":
+            ttl_name = parts[2]
+            await self.select_ttl(update, context, ttl_name)
+        elif action == "custom":
+            await self.custom_image_input(update, context)
+        elif action == "user_manage":
+            await self.user_management(update, context)
+        elif action == "container_manage":
+            await self.container_management(update, context)
+        elif action == "admin_stats":
+            await self.admin_stats(update, context)
+        elif action == "add_user":
+            await self.add_user_prompt(update, context)
+        elif action == "confirm_user":  # Добавляем обработку подтверждения пользователя
+            await self.confirm_add_user(update, context)
+
+    async def container_status(self, update: Update, context: CallbackContext):
+      """Показывает состояние контейнера пользователя"""
+      query = update.callback_query
+      user_id = query.from_user.id
+
+      session_info = self.get_session_info(user_id)
+      if not session_info:
+          await query.edit_message_text("❌ У вас нет активного контейнера.")
+          return
+
+      container_id = session_info.get('container_id')
+      if not container_id:
+          await query.edit_message_text("❌ Ошибка: ID контейнера не найден")
+          return
+
+      try:
+          container =   self.docker_client.containers.get(container_id)
+          stats = container.stats(stream=False)
+
+          # Анализируем статистику
+          cpu_stats = stats['cpu_stats']
+          precpu_stats = stats['precpu_stats']
+          memory_stats = stats['memory_stats']
+
+          # Расчет использования CPU
+          cpu_delta = cpu_stats['cpu_usage']['total_usage'] - precpu_stats['cpu_usage']['total_usage']
+          system_delta = cpu_stats['system_cpu_usage'] - precpu_stats['system_cpu_usage']
+          cpu_percent = 0.0
+          if system_delta > 0 and cpu_delta > 0:
+              cpu_percent = (cpu_delta / system_delta) * 100.0
+
+          # Использование памяти
+          memory_usage = memory_stats.get('usage', 0)
+          memory_limit = memory_stats.get('limit', 1)
+          memory_percent = (memory_usage / memory_limit) * 100.0
+
+        # Информация о контейнере
+          image_name = self.available_images.get(session_info.get('image', ''), session_info.get('image', 'Кастомный'))
+          shell = session_info.get('shell', 'bash')
+          config_name = session_info.get('config_name', 'Минимальная')
+          network = "включена" if session_info.get('network', True) else "выключена"
+          created_at = session_info.get('created_at', 'Неизвестно')
+
+          # Очередь команд
+          queue_size = self.command_queues.get(user_id, asyncio.Queue()).qsize() if user_id in self.command_queues else 0
+
+          keyboard = [
+              [InlineKeyboardButton("🔄 Обновить", callback_data=f"status:{user_id}")],
+              [InlineKeyboardButton("⏹️ Остановить конвейер", callback_data=f"stop:{user_id}")],
+              [InlineKeyboardButton("🔙 Главное меню", callback_data=f"main:{user_id}")]
+          ]
+          reply_markup = InlineKeyboardMarkup(keyboard)
+
+          await query.edit_message_text(
+              f"📊 Состояние конвейера\n\n"
+              f"🐧 Образ: {image_name}\n"
+              f"💻 Шелл: {shell}\n"
+              f"⚙️ Конфигурация: {config_name}\n"
+              f"🌐 Сеть: {network}\n"
+              f"📅 Создан: {created_at[:19]}\n\n"
+              f"📈 Использование ресурсов:\n"
+              f"• CPU: {cpu_percent:.1f}%\n"
+              f"• Память: {memory_percent:.1f}% ({memory_usage // (1024*1024)}MB / {memory_limit // (1024*1024)}MB)\n"
+              f"• Команд в очереди: {queue_size}\n\n"
+              f"🟢 Контейнер работает нормально",
+              reply_markup=reply_markup
+         )
+
+      except Exception as e:
+          logger.error(f"Error getting container status for user {user_id}: {e}")
+          await query.edit_message_text(
+              f"❌ Ошибка при получении статуса контейнера: {str(e)}",
+              reply_markup=InlineKeyboardMarkup([
+                  [InlineKeyboardButton("🔙 Главное меню", callback_data=f"main:{user_id}")]
+              ])
+          )
+
+    async def stop_session(self, update: Update, context: CallbackContext):
+        """Останавливает текущую сессию"""
+        query = update.callback_query
+        user_id = query.from_user.id
+
+        # Останавливаем все команды пользователя
+        await self.cancel_user_commands(user_id)
+
+        # Удаляем сессию и контейнер
+        session_key = f"session:{user_id}"
+        session_data = self.redis.get(session_key)
+
+        if session_data:
+            try:
+                session = json.loads(session_data)
+                container_id = session.get('container_id')
+                if container_id:
+                    try:
+                        container = self.docker_client.containers.get(container_id)
+                        logger.info(f"Stopping container {container_id} for user {user_id}")
+                        container.stop()
+                        container.remove()
+                        logger.info(f"Остановлен контейнер: {container_id}")
+                    except Exception as e:
+                        logger.error(f"Ошибка при остановке контейнера: {e}")
+            except Exception as e:
+                logger.error(f"Ошибка при обработке сессии: {e}")
+
+        self.redis.delete(session_key)
+        logger.info(f"Session stopped for user {user_id}")
+
+        keyboard = [
+            [InlineKeyboardButton("🚀 Запустить конвейер", callback_data=f"launch:{user_id}")],
+            [InlineKeyboardButton("🔙 Главное меню", callback_data=f"main:{user_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            "✅ Конвейер остановлен и контейнер удален.",
+            reply_markup=reply_markup
+        )
+
+    async def cancel_user_commands(self, user_id):
+        """Отменяет все команды пользователя"""
+        if user_id in self.command_workers:
+            self.command_workers[user_id].cancel()
+            del self.command_workers[user_id]
+            logger.info(f"Cancelled command worker for user {user_id}")
+
+        if user_id in self.command_queues:
+            # Очищаем очередь
+            while not self.command_queues[user_id].empty():
+                try:
+                    self.command_queues[user_id].get_nowait()
+                    self.command_queues[user_id].task_done()
+                except:
+                    break
+            del self.command_queues[user_id]
+            logger.info(f"Cleared command queue for user {user_id}")
+
+        if user_id in self.active_commands:
+            del self.active_commands[user_id]
+            logger.info(f"Removed active commands for user {user_id}")
+
+    async def cancel_command(self, update: Update, context: CallbackContext):
+        """Обработчик команды /cancel - отменяет все команды пользователя"""
+        user_id = update.effective_user.id
+
+        await self.cancel_user_commands(user_id)
+
+        await update.message.reply_text(
+            "✅ Все ваши команды отменены, очередь очищена."
+        )
+
+    async def launch_menu(self, update: Update, context: CallbackContext):
+        """Меню запуска конвейера"""
+        query = update.callback_query
+        user_id = query.from_user.id
+        is_confirmed = self.is_confirmed_user(user_id)
+
+        # Создаем клавиатуру с доступными образами
+        keyboard = []
+        row = []
+
+        for image_key, image_name in self.available_images.items():
+            # Проверяем доступность образов
+            if image_key == "archlinux:latest" and not is_confirmed:
+                continue  # Пропускаем Arch для неподтвержденных
+
+            button = InlineKeyboardButton(f"🐧 {image_name}", callback_data=f"image:{user_id}:{image_key}")
+            row.append(button)
+
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+
+        if row:
+            keyboard.append(row)
+
+        # Добавляем опцию кастомного образа для подтвержденных пользователей
+        if is_confirmed:
+            keyboard.append([InlineKeyboardButton("📝 Кастомный образ", callback_data=f"custom:{user_id}")])
+
+        # Кнопка назад
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data=f"main:{user_id}")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        status_text = "✅ Подтвержденный пользователь" if is_confirmed else "⏳ Обычный пользователь"
+
+        await query.edit_message_text(
+            f"🚀 Запуск конвейера\n\n"
+            f"Статус: {status_text}\n\n"
+            "Выберите образ системы:",
+            reply_markup=reply_markup
+        )
+
+    async def select_image(self, update: Update, context: CallbackContext, image_key: str):
+        """Обработка выбора образа"""
+        query = update.callback_query
+        context.user_data['selected_image'] = image_key
+
+        # Теперь предлагаем выбрать шелл
+        keyboard = []
+
+        for shell in self.available_shells:
+            button = InlineKeyboardButton(f"💻 {shell}", callback_data=f"shell:{query.from_user.id}:{shell}")
+            keyboard.append([button])
+
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data=f"launch:{query.from_user.id}")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        image_name = self.available_images.get(image_key, image_key)
+
+        await query.edit_message_text(
+            f"🐧 Выбран образ: {image_name}\n\n"
+            "Теперь выберите шелл:",
+            reply_markup=reply_markup
+        )
+
+    async def custom_image_input(self, update: Update, context: CallbackContext):
+        """Запрос кастомного образа"""
+        query = update.callback_query
+        user_id = query.from_user.id
+
+        await query.edit_message_text(
+            "📝 Кастомный образ\n\n"
+            "Введите имя Docker образа (например: python:3.9, node:18, nginx:latest):\n\n"
+            "Или отправьте /cancel для отмены."
+        )
+
+        # Сохраняем состояние для ConversationHandler
+        context.user_data['waiting_for_custom_image'] = True
+        return CUSTOM_IMAGE
+
+    async def process_custom_image(self, update: Update, context: CallbackContext):
+        """Обработка введенного кастомного образа"""
+        custom_image = update.message.text.strip()
+        user_id = update.effective_user.id
+        context.user_data['selected_image'] = custom_image
+        context.user_data['waiting_for_custom_image'] = False
+
+        # Предлагаем выбрать шелл
+        keyboard = []
+
+        for shell in self.available_shells:
+            button = InlineKeyboardButton(f"💻 {shell}", callback_data=f"shell:{user_id}:{shell}")
+            keyboard.append([button])
+
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data=f"launch:{user_id}")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            f"🐧 Выбран образ: {custom_image}\n\n"
+            "Теперь выберите шелл:",
+            reply_markup=reply_markup
+        )
+
+        return ConversationHandler.END
+
+    async def select_shell(self, update: Update, context: CallbackContext, shell: str):
+        """Обработка выбора шелла и переход к выбору конфигурации"""
+        query = update.callback_query
+        user_id = query.from_user.id
+
+        if shell not in self.available_shells:
+            await query.edit_message_text(f"❌ Ошибка: неизвестный шелл {shell}")
+            return
+
+        context.user_data['selected_shell'] = shell
+
+        # Теперь предлагаем выбрать конфигурацию ресурсов
+        is_confirmed = self.is_confirmed_user(user_id)
+        is_admin = self.is_admin(user_id)
+
+        keyboard = []
+
+        for config_key, config in self.resource_configs.items():
+            # Проверяем доступность конфигураций
+            if config_key == "medium" and not is_confirmed:
+                continue
+            if config_key == "enhanced" and not is_confirmed:
+                continue
+            if config_key == "maximum" and not is_admin:
+                continue
+
+            button = InlineKeyboardButton(
+                f"⚙️ {config['name']} ({config['description']})",
+                callback_data=f"config:{user_id}:{config_key}"
+            )
+            keyboard.append([button])
+
+        # Добавляем переключатель сети
+        network_status = context.user_data.get('network', True)
+        network_text = "🌐 Сеть: ВКЛ" if network_status else "🚫 Сеть: ВЫКЛ"
+        network_callback = f"network:{user_id}:{'false' if network_status else 'true'}"
+        keyboard.append([InlineKeyboardButton(network_text, callback_data=network_callback)])
+
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data=f"launch:{user_id}")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        image_key = context.user_data.get('selected_image', 'alpine:latest')
+        image_name = self.available_images.get(image_key, image_key)
+
+        await query.edit_message_text(
+            f"🚀 Настройка конвейера\n\n"
+            f"🐧 Образ: {image_name}\n"
+            f"💻 Шелл: {shell}\n\n"
+            f"⚙️ Выберите конфигурацию ресурсов:\n\n"
+            f"Доступные конфигурации зависят от вашего статуса.",
+            reply_markup=reply_markup
+        )
+
+    async def toggle_network(self, update: Update, context: CallbackContext, network_state: bool):
+        """Переключает состояние сети"""
+        query = update.callback_query
+        context.user_data['network'] = network_state
+
+        # Возвращаемся к выбору конфигурации
+        shell = context.user_data.get('selected_shell', 'bash')
+        await self.select_shell(update, context, shell)
+
+    async def select_config(self, update: Update, context: CallbackContext, config_key: str):
+        """Обработка выбора конфигурации и переход к выбору TTL"""
+        query = update.callback_query
+        user_id = query.from_user.id
+
+        if config_key not in self.resource_configs:
+            await query.edit_message_text("❌ Ошибка: неизвестная конфигурация")
+            return
+
+        context.user_data['selected_config'] = config_key
+
+        # Теперь предлагаем выбрать время жизни
+        is_confirmed = self.is_confirmed_user(user_id)
+        is_admin = self.is_admin(user_id)
+
+        keyboard = []
+        row = []
+
+        for ttl_name, ttl_seconds in self.ttl_options.items():
+            # Для неподтвержденных пользователей ограничиваем максимальное время
+            if not is_confirmed and ttl_seconds and ttl_seconds > 86400:  # 24 часа
+                continue
+
+            # "Всегда" только для админов
+            if ttl_name == "always" and not is_admin:
+                continue
+
+            button = InlineKeyboardButton(f"⏰ {ttl_name}", callback_data=f"ttl:{user_id}:{ttl_name}")
+            row.append(button)
+
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+
+        if row:
+            keyboard.append(row)
+
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data=f"launch:{user_id}")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        image_key = context.user_data.get('selected_image', 'alpine:latest')
+        image_name = self.available_images.get(image_key, image_key)
+        config_name = self.resource_configs[config_key]['name']
+        network = context.user_data.get('network', True)
+
+        max_ttl_text = "12 дней" if is_confirmed else "24 часа"
+
+        await query.edit_message_text(
+            f"🚀 Настройка конвейера\n\n"
+            f"🐧 Образ: {image_name}\n"
+            f"💻 Шелл: {context.user_data.get('selected_shell', 'bash')}\n"
+            f"⚙️ Конфигурация: {config_name}\n"
+            f"🌐 Сеть: {'включена' if network else 'выключена'}\n\n"
+            f"⏰ Сколько будет жить ваш конвейер?\n"
+            f"Максимум для вашего статуса: {max_ttl_text}\n\n"
+            f"Выберите время жизни:",
+            reply_markup=reply_markup
+        )
+
+    async def select_ttl(self, update: Update, context: CallbackContext, ttl_name: str):
+        """Обработка выбора TTL и запуск контейнера"""
+        query = update.callback_query
+        user_id = query.from_user.id
+
+        if ttl_name not in self.ttl_options:
+            await query.edit_message_text("❌ Ошибка: неизвестное время жизни")
+            return
+
+        ttl_seconds = self.ttl_options[ttl_name]
+
+        shell = context.user_data.get('selected_shell', 'bash')
+        image_key = context.user_data.get('selected_image', 'alpine:latest')
+        config_key = context.user_data.get('selected_config', 'minimal')
+        network = context.user_data.get('network', True)
+
+        # Запускаем контейнер
+        try:
+            await query.edit_message_text("⏳ Создаю контейнер...")
+
+            container = await self.create_user_container(
+                user_id, image_key, shell, ttl_seconds, ttl_name,
+                config_key, network
+            )
+
+            # Отправляем информацию о запущенном контейнере
+            image_name = self.available_images.get(image_key, image_key)
+            ttl_display = "всегда" if ttl_name == "always" else ttl_name
+            config_name = self.resource_configs[config_key]['name']
+
+            keyboard = [
+                [InlineKeyboardButton("🔙 Главное меню", callback_data=f"main:{user_id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"✅ Контейнер запущен!\n\n"
+                f"🐧 Образ: {image_name}\n"
+                f"💻 Шелл: {shell}\n"
+                f"⚙️ Конфигурация: {config_name}\n"
+                f"🌐 Сеть: {'включена' if network else 'выключена'}\n"
+                f"⏰ Время жизни: {ttl_display}\n\n"
+                f"Теперь вы можете отправлять команды для выполнения в контейнере.",
+                reply_markup=reply_markup
+            )
+
+        except Exception as e:
+            logger.error(f"Error creating container: {e}")
+            await query.edit_message_text(f"❌ Ошибка при создании контейнера: {str(e)}")
+
+    async def create_user_container(self, user_id, image, shell="bash", ttl_seconds=None, ttl_display="unknown",
+                                  config_key="minimal", network=True):
+        """Создает контейнер для пользователя с выбранными параметрами"""
+        # Проверяем, есть ли уже контейнер
+        session_key = f"session:{user_id}"
+        session_data = self.redis.get(session_key)
+
+        if session_data:
+            try:
+                session = json.loads(session_data)
+                container_id = session.get('container_id')
+                if container_id:
+                    try:
+                        container = self.docker_client.containers.get(container_id)
+                        # Останавливаем старый контейнер
+                        logger.info(f"Stopping old container {container_id} for user {user_id}")
+                        container.stop()
+                        container.remove()
+                        logger.info(f"Removed old container {container_id}")
+                    except Exception as e:
+                        logger.warning(f"Could not remove old container: {e}")
+            except Exception as e:
+                logger.error(f"Error processing old session: {e}")
+
+        # Получаем конфигурацию ресурсов
+        config = self.resource_configs[config_key]
+
+        # Создаем новый контейнер
+        container_kwargs = {
+            "image": image,
+            "command": f"tail -f /dev/null",
+            "name": f"terminal_bot_{user_id}_{os.urandom(4).hex()}",
+            "network_mode": "bridge" if network else "none",
+            "read_only": False,
+            "detach": True,
+            "tty": True
+        }
+
+        # Добавляем ограничения ресурсов
+        container_kwargs.update({
+            "mem_limit": config["mem_limit"],
+            "cpu_period": config["cpu_period"],
+            "cpu_quota": config["cpu_quota"],
+            "pids_limit": config["pids_limit"]
+        })
+
+        # Для неподтвержденных пользователей добавляем дополнительные ограничения
+        if not self.is_confirmed_user(user_id):
+            container_kwargs.update({
+                "mem_limit": "64m",  # Фиксированный лимит для неподтвержденных
+                "pids_limit": 20
+            })
+
+        logger.info(f"Creating container for user {user_id} with image {image}, config {config_key}, network: {network}")
+        container = self.docker_client.containers.run(**container_kwargs)
+
+        # Сохраняем информацию о сессии
+        session_data = {
+            'container_id': container.id,
+            'image': image,
+            'shell': shell,
+            'ttl_seconds': ttl_seconds,
+            'ttl_display': ttl_display,
+            'config_name': config["name"],
+            'network': network,
+            'created_at': datetime.now().isoformat(),
+            'is_confirmed': self.is_confirmed_user(user_id)
+        }
+
+        # Устанавливаем TTL если указано
+        if ttl_seconds:
+            self.redis.setex(session_key, ttl_seconds, json.dumps(session_data))
+        else:
+            self.redis.set(session_key, json.dumps(session_data))
+
+        logger.info(f"Created container {container.id} for user {user_id} with image {image}, shell {shell}, TTL: {ttl_display}, config: {config_key}")
+        return container
+
+    async def start_command_worker(self, user_id):
+        """Запускает воркер для обработки команд пользователя"""
+        if user_id in self.command_workers:
+            self.command_workers[user_id].cancel()
+
+        if user_id not in self.command_queues:
+            self.command_queues[user_id] = asyncio.Queue()
+
+        # Создаем задачу для обработки команд
+        self.command_workers[user_id] = asyncio.create_task(
+            self._command_worker(user_id)
+        )
+
+    async def _command_worker(self, user_id):
+        """Воркер для обработки команд пользователя"""
+        while True:
+            try:
+                # Ждем команду из очереди
+                command_data = await self.command_queues[user_id].get()
+
+                if command_data is None:  # Сигнал остановки
+                    break
+
+                update, context, command, status_msg = command_data
+
+                # Выполняем команду
+                await self._execute_single_command(update, context, command, status_msg, user_id)
+
+                # Помечаем задачу как выполненную
+                self.command_queues[user_id].task_done()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in command worker for user {user_id}: {e}")
+                try:
+                    await status_msg.edit_text(f"❌ Ошибка воркера: {str(e)}")
+                except:
+                    pass
+
+    async def _execute_single_command(self, update, context, command, status_msg, user_id):
+        """Выполняет одну команду для пользователя"""
+        try:
+            session_key = f"session:{user_id}"
+            session_data = self.redis.get(session_key)
+
+            if not session_data:
+                await status_msg.edit_text("❌ Сессия не найдена. Используйте /start для создания новой.")
+                return
+
+            session = json.loads(session_data)
+            container_id = session.get('container_id')
+            shell = session.get('shell', 'bash')
+
+            if not container_id:
+                await status_msg.edit_text("❌ Ошибка: ID контейнера не найден")
+                return
+
+            # Получаем контейнер
+            try:
+                container = self.docker_client.containers.get(container_id)
+            except:
+                await status_msg.edit_text("❌ Контейнер не найден. Используйте /start для создания нового.")
+                self.redis.delete(session_key)
+                return
+
+            # Проверка безопасности для неподтвержденных пользователей
+            if not self.is_confirmed_user(user_id) and await self.is_command_dangerous(command):
+                await status_msg.edit_text("❌ Команда запрещена для выполнения")
+                return
+
+            # Выполняем команду через выбранный шелл
+            full_command = f"{shell} -c \"{command}\""
+
+            # Выполняем команду в отдельном потоке
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                self.thread_pool,
+                self._run_command_sync,
+                container,
+                full_command
+            )
+
+            output, exit_code = result
+
+            if exit_code != 0 and not output:
+                output = f"Команда завершилась с кодом ошибки: {exit_code}"
+            elif not output:
+                output = "Команда выполнена успешно (нет вывода)"
+
+            await self.send_smart_output(status_msg, output, exit_code)
+
+        except Exception as e:
+            logger.error(f"Error executing command for user {user_id}: {e}")
+            try:
+                await status_msg.edit_text(f"❌ Ошибка: {str(e)}")
+            except:
+                pass
+
+    def _run_command_sync(self, container, full_command):
+        """Синхронное выполнение команды (вызывается в отдельном потоке)"""
+        try:
+            result = container.exec_run(
+                full_command,
+                stdout=True,
+                stderr=True,
+                stdin=False
+            )
+
+            output = result.output.decode('utf-8', errors='ignore') if result.output else ""
+            exit_code = result.exit_code
+
+            return output, exit_code
+        except Exception as e:
+            logger.error(f"Error in sync command execution: {e}")
+            return f"Ошибка выполнения: {str(e)}", 1
+
+    async def execute_command(self, update: Update, context: CallbackContext):
+        """Добавляет команду в очередь пользователя"""
+        user_id = update.effective_user.id
+        command = update.message.text.strip()
+
+        # Проверяем, есть ли активная сессия
+        if not self.has_active_session(user_id):
+            await update.message.reply_text(
+                "❌ У вас нет активного контейнера. Используйте /container для создания нового."
+            )
+            return
+
+        # Запускаем воркер если нужно
+        if user_id not in self.command_workers:
+            await self.start_command_worker(user_id)
+
+        # Создаем очередь если нужно
+        if user_id not in self.command_queues:
+            self.command_queues[user_id] = asyncio.Queue()
+
+        # Отправляем сообщение о выполнении
+        status_msg = await update.message.reply_text("⏳ Команда добавлена в очередь...")
+
+        # Добавляем команду в очередь
+        await self.command_queues[user_id].put((update, context, command, status_msg))
+
+        # Обновляем статус
+        queue_size = self.command_queues[user_id].qsize()
+        await status_msg.edit_text(f"⏳ Команда в очереди... (позиция: {queue_size})")
+
+    async def docker_command(self, update: Update, context: CallbackContext):
+        """Обработка команд с префиксом /docker в группах"""
+        user_id = update.effective_user.id
+
+        # Проверяем, есть ли аргументы
+        if not context.args:
+            await update.message.reply_text(
+                "Использование: /docker <команда>\n\n"
+                "Примеры:\n"
+                "/docker ls\n"
+                "/docker pwd\n"
+                "/docker apt update"
+            )
+            return
+
+        command = ' '.join(context.args)
+
+        # Проверяем, есть ли активная сессия
+        if not self.has_active_session(user_id):
+            await update.message.reply_text(
+                "❌ У вас нет активного контейнера. Используйте /container в личном чате с ботом для создания контейнера."
+            )
+            return
+
+        # Запускаем воркер если нужно
+        if user_id not in self.command_workers:
+            await self.start_command_worker(user_id)
+
+        # Создаем очередь если нужно
+        if user_id not in self.command_queues:
+            self.command_queues[user_id] = asyncio.Queue()
+
+        # Отправляем сообщение о выполнении
+        status_msg = await update.message.reply_text(f"⏳ Команда для @{update.effective_user.username or update.effective_user.first_name} добавлена в очередь...")
+
+        # Добавляем команду в очередь
+        await self.command_queues[user_id].put((update, context, command, status_msg))
+
+        # Обновляем статус
+        queue_size = self.command_queues[user_id].qsize()
+        await status_msg.edit_text(f"⏳ Команда в очереди... (позиция: {queue_size})")
+
+    async def send_smart_output(self, message, output: str, exit_code: int):
+        """Умная отправка вывода с форматированием"""
+        try:
+            if len(output) > 4000:
+                output = output[:4000] + "\n... (вывод обрезан)"
+
+            status_icon = "✅" if exit_code == 0 else "❌"
+            status_text = "успешно" if exit_code == 0 else f"ошибка (код: {exit_code})"
+
+            await message.edit_text(
+                f"{status_icon} Команда выполнена {status_text}:\n```\n{output}\n```",
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.error(f"Error in send_smart_output: {e}")
+            try:
+                if len(output) > 4000:
+                    output = output[:4000] + "\n... (вывод обрезан)"
+                await message.edit_text(f"```\n{output}\n```", parse_mode='Markdown')
+            except Exception as e2:
+                logger.error(f"Error sending plain text: {e2}")
+                await message.edit_text("❌ Ошибка при отправке вывода")
+
+    async def information_menu(self, update: Update, context: CallbackContext):
+        """Меню информации"""
+        query = update.callback_query
+        user_id = query.from_user.id
+        is_confirmed = self.is_confirmed_user(user_id)
+
+        keyboard = [
+            [InlineKeyboardButton("🔙 Назад", callback_data=f"main:{user_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        status_text = "✅ Подтвержденный пользователь" if is_confirmed else "⏳ Обычный пользователь"
+
+        await query.edit_message_text(
+            f"ℹ️ Информация о боте\n\n"
+            f"🤖 Terminal Bot - безопасный Docker-терминал\n\n"
+            f"📊 Ваш статус: {status_text}\n\n"
+            f"🔒 Безопасность:\n"
+            f"• Изолированные Docker-контейнеры\n"
+            f"• Ограничение ресурсов для неподтвержденных\n"
+            f"• Черный список опасных команд\n\n"
+            f"🐧 Доступные образы:\n"
+            f"• Alpine, Ubuntu, Debian, Kali, openSUSE, Fedora\n"
+            f"• Arch Linux (только для подтвержденных)\n"
+            f"• Кастомные образы (только для подтвержденных)\n\n"
+            f"💻 Доступные шеллы: bash, sh\n\n"
+            f"🌐 Сеть: включена для всех контейнеров\n\n"
+            f"⏰ Время сеанса:\n"
+            f"• Подтвержденные: до 12 дней\n"
+            f"• Неподтвержденные: до 24 часов\n"
+            f"• Администраторы: бессрочно\n\n"
+            f"💬 Использование в группах:\n"
+            f"• /docker <команда> - выполнить команду\n"
+            f"• /docker - справка",
+            reply_markup=reply_markup
+        )
+
+    async def admin_menu(self, update: Update, context: CallbackContext):
+        """Админ панель"""
+        query = update.callback_query
+        user_id = query.from_user.id
+
+        if not self.is_admin(user_id):
+            await query.edit_message_text("❌ У вас нет доступа к админ панели")
+            return
+
+        keyboard = [
+            [InlineKeyboardButton("👥 Управление пользователями", callback_data=f"user_manage:{user_id}")],
+            [InlineKeyboardButton("🐳 Управление контейнерами", callback_data=f"container_manage:{user_id}")],
+            [InlineKeyboardButton("📊 Статистика", callback_data=f"admin_stats:{user_id}")],
+            [InlineKeyboardButton("🔙 Назад", callback_data=f"main:{user_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            "👑 Админ панель\n\n"
+            "Выберите раздел для управления:",
+            reply_markup=reply_markup
+        )
+
+    async def user_management(self, update: Update, context: CallbackContext):
+        """Управление пользователями"""
+        query = update.callback_query
+        user_id = query.from_user.id
+
+        if not self.is_admin(user_id):
+            await query.edit_message_text("❌ У вас нет доступа")
+            return
+
+        # Получаем список подтвержденных пользователей
+        confirmed_users = self.redis.smembers("confirmed_users")
+
+        keyboard = [
+            [InlineKeyboardButton("➕ Добавить пользователя", callback_data=f"add_user:{user_id}")],
+            [InlineKeyboardButton("🔙 Назад", callback_data=f"admin:{user_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        users_list = "\n".join([f"• {user_id}" for user_id in confirmed_users]) if confirmed_users else "• Нет пользователей"
+
+        await query.edit_message_text(
+            f"👥 Управление пользователями\n\n"
+            f"✅ Подтвержденные пользователи:\n{users_list}\n\n"
+            f"Выберите действие:",
+            reply_markup=reply_markup
+        )
+
+    async def container_management(self, update: Update, context: CallbackContext):
+        """Управление контейнерами"""
+        query = update.callback_query
+        user_id = query.from_user.id
+
+        if not self.is_admin(user_id):
+            await query.edit_message_text("❌ У вас нет доступа")
+            return
+
+        # Получаем все активные контейнеры
+        try:
+            containers = self.docker_client.containers.list(
+                filters={"name": "terminal_bot_"}
+            )
+
+            containers_list = ""
+            for container in containers:
+                container_name = container.name
+                container_status = container.status
+                containers_list += f"• {container_name} - {container_status}\n"
+
+            if not containers_list:
+                containers_list = "• Нет активных контейнеров"
+
+        except Exception as e:
+            logger.error(f"Error getting containers: {e}")
+            containers_list = "• Ошибка при получении контейнеров"
+
+        keyboard = [
+            [InlineKeyboardButton("🔄 Обновить", callback_data=f"container_manage:{user_id}")],
+            [InlineKeyboardButton("🔙 Назад", callback_data=f"admin:{user_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            f"🐳 Управление контейнерами\n\n"
+            f"📊 Активные контейнеры:\n{containers_list}",
+            reply_markup=reply_markup
+        )
+
+    async def admin_stats(self, update: Update, context: CallbackContext):
+        """Статистика админ-панели"""
+        query = update.callback_query
+        user_id = query.from_user.id
+
+        if not self.is_admin(user_id):
+            await query.edit_message_text("❌ У вас нет доступа")
+            return
+
+        # Получаем статистику
+        try:
+            # Количество подтвержденных пользователей
+            confirmed_users = self.redis.scard("confirmed_users")
+
+            # Количество активных сессий
+            active_sessions = 0
+            for key in self.redis.keys("session:*"):
+                active_sessions += 1
+
+            # Количество активных контейнеров
+            active_containers = len(self.docker_client.containers.list(filters={"name": "terminal_bot_"}))
+
+        except Exception as e:
+            logger.error(f"Error getting stats: {e}")
+            confirmed_users = "Ошибка"
+            active_sessions = "Ошибка"
+            active_containers = "Ошибка"
+
+        keyboard = [
+            [InlineKeyboardButton("🔄 Обновить", callback_data=f"admin_stats:{user_id}")],
+            [InlineKeyboardButton("🔙 Назад", callback_data=f"admin:{user_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            f"📊 Статистика системы\n\n"
+            f"👥 Пользователи:\n"
+            f"• Подтвержденных: {confirmed_users}\n"
+            f"• Активных сессий: {active_sessions}\n\n"
+            f"🐳 Контейнеры:\n"
+            f"• Активных: {active_containers}",
+            reply_markup=reply_markup
+        )
+
+    async def add_user_prompt(self, update: Update, context: CallbackContext):
+        """Запрос на добавление пользователя"""
+        query = update.callback_query
+        user_id = query.from_user.id
+
+        if not self.is_admin(user_id):
+            await query.edit_message_text("❌ У вас нет доступа")
+            return
+
+        await query.edit_message_text(
+            "👤 Добавление пользователя\n\n"
+            "Отправьте ID пользователя для добавления в подтвержденные.\n\n"
+            "Чтобы узнать ID пользователя, попросите его отправить /start боту @userinfobot\n\n"
+            "Или отправьте /cancel для отмены."
+        )
+
+        context.user_data['waiting_for_user_id'] = True
+        return CONFIRMING_USER
+
+    async def receive_user_id(self, update: Update, context: CallbackContext):
+        """Получение ID пользователя для добавления"""
+        user_id_input = update.message.text.strip()
+        admin_id = update.effective_user.id
+
+        # Проверяем, является ли ввод числом (ID)
+        if not user_id_input.isdigit():
+            await update.message.reply_text("❌ ID пользователя должен быть числом. Попробуйте снова или отправьте /cancel")
+            return CONFIRMING_USER
+
+        user_id_to_add = int(user_id_input)
+        context.user_data['waiting_for_user_id'] = False
+
+        # Создаем клавиатуру для подтверждения
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Подтвердить", callback_data=f"confirm_user:{admin_id}:{user_id_to_add}"),
+                InlineKeyboardButton("❌ Отмена", callback_data=f"user_manage:{admin_id}")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            f"👤 Подтверждение добавления пользователя\n\n"
+            f"ID пользователя: {user_id_to_add}\n\n"
+            f"⚠️ Внимание: После подтверждения пользователь получит:\n"
+            f"• Доступ к конвейеру навсегда\n"
+            f"• Возможность выбирать любой образ (включая Arch Linux)\n"
+            f"• Неограниченное время сеанса\n\n"
+            f"Вы уверены, что хотите добавить этого пользователя?",
+            reply_markup=reply_markup
+        )
+
+        return ConversationHandler.END
+
+    async def confirm_add_user(self, update: Update, context: CallbackContext):
+        """Подтверждение добавления пользователя"""
+        query = update.callback_query
+        await query.answer()
+
+        # Извлекаем ID пользователя и админа из callback_data
+        callback_data = query.data
+        parts = callback_data.split(':')
+        admin_id = int(parts[1])
+        user_id_to_add = int(parts[2])
+
+        # Проверяем, что нажал тот же админ
+        if query.from_user.id != admin_id:
+            await query.answer("❌ Это подтверждение не для вас!", show_alert=True)
+            return
+
+        if not self.is_admin(admin_id):
+            await query.edit_message_text("❌ У вас нет доступа")
+            return
+
+        # Добавляем пользователя в подтвержденные
+        self.add_confirmed_user(user_id_to_add)
+
+        keyboard = [
+            [InlineKeyboardButton("🔙 Назад", callback_data=f"user_manage:{admin_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            f"✅ Пользователь {user_id_to_add} успешно добавлен в подтвержденные!",
+            reply_markup=reply_markup
+        )
+
+    async def is_command_dangerous(self, command: str) -> bool:
+        """Проверяет команду на опасность для неподтвержденных пользователей"""
+        dangerous_patterns = [
+            'rm -rf /', 'rm -rf /*', 'dd if=', 'mkfs', ':(){:|:&};:',
+            '> /dev/sd', '> /dev/hd', 'chmod 777 /', 'passwd root'
+        ]
+
+        command_lower = command.lower()
+        return any(pattern in command_lower for pattern in dangerous_patterns)
+
+    async def cancel(self, update: Update, context: CallbackContext):
+        """Отмена текущей операции"""
+        context.user_data.clear()
+        await update.message.reply_text("Операция отменена.")
+        return ConversationHandler.END
+
+    async def inline_query(self, update: Update, context: CallbackContext):
+        """Обработчик инлайн-запросов - показывает информацию о контейнере пользователя"""
+        user_id = update.inline_query.from_user.id
+
+        # Проверяем сессию текущего пользователя (того, кто сделал инлайн-запрос)
+        session_info = self.get_session_info(user_id)
+        if not session_info:
+            results = [
+                InlineQueryResultArticle(
+                    id='1',
+                    title="❌ Нет активного контейнера",
+                    description="Сначала создайте контейнер через /container",
+                    input_message_content=InputTextMessageContent(
+                        "❌ У вас нет активного контейнера. Используйте /container для создания нового."
+                    )
+                )
+            ]
+            await update.inline_query.answer(results)
+            return
+
+        # Проверяем, существует ли контейнер на самом деле
+        container_id = session_info.get('container_id')
+        if not container_id:
+            # Удаляем невалидную сессию
+            session_key = f"session:{user_id}"
+            self.redis.delete(session_key)
+            results = [
+                InlineQueryResultArticle(
+                    id='1',
+                    title="❌ Нет активного контейнера",
+                    description="Сначала создайте контейнер через /container",
+                    input_message_content=InputTextMessageContent(
+                        "❌ У вас нет активного контейнера. Используйте /container для создания нового."
+                    )
+                )
+            ]
+            await update.inline_query.answer(results)
+            return
+
+        try:
+            # Проверяем, что контейнер действительно существует и работает
+            container = self.docker_client.containers.get(container_id)
+            if container.status != 'running':
+                # Контейнер существует, но не запущен - удаляем сессию
+                session_key = f"session:{user_id}"
+                self.redis.delete(session_key)
+                results = [
+                    InlineQueryResultArticle(
+                        id='1',
+                        title="❌ Контейнер не запущен",
+                        description="Создайте новый контейнер через /container",
+                        input_message_content=InputTextMessageContent(
+                            "❌ Ваш контейнер не запущен. Используйте /container для создания нового."
+                        )
+                    )
+                ]
+                await update.inline_query.answer(results)
+                return
+        except docker.errors.NotFound:
+            # Контейнер не найден - удаляем сессию
+            session_key = f"session:{user_id}"
+            self.redis.delete(session_key)
+            results = [
+                InlineQueryResultArticle(
+                    id='1',
+                    title="❌ Контейнер не найден",
+                    description="Создайте новый контейнер через /container",
+                    input_message_content=InputTextMessageContent(
+                        "❌ Ваш контейнер не найден. Используйте /   container для создания нового."
+                    )
+                )
+            ]
+            await update.inline_query.answer(results)
+            return
+        except Exception as e:
+            logger.error(f"Error checking container in inline query for user {user_id}: {e}")
+            results = [
+                InlineQueryResultArticle(
+                    id='1',
+                    title="❌ Ошибка проверки контейнера",
+                    description="Попробуйте позже",
+                    input_message_content=InputTextMessageContent(
+                        "❌ Произошла ошибка при проверке контейнера. Попробуйте позже."
+                    )
+                )
+            ]
+            await update.inline_query.answer(results)
+            return
+
+        # Если все проверки пройдены, показываем информацию о контейнере ТЕКУЩЕГО пользователя
+        image_name = self.available_images.get(session_info.get('image', ''), session_info.get('image', 'Кастомный'))
+        shell = session_info.get('shell', 'bash')
+        config_name = session_info.get('config_name', 'Минимальная')
+        network = "включена" if session_info.get('network', True) else "выключена"
+        ttl = session_info.get('ttl_display', 'Неизвестно')
+        created_at = session_info.get('created_at', 'Неизвестно')
+
+        text = (f"🐳 Ваш контейнер:\n"
+                f"🐧 Образ: {image_name}\n"
+                f"💻 Шелл: {shell}\n"
+                f"⚙️ Конфигурация: {config_name}\n"
+                f"🌐 Сеть: {network}\n"
+                f"⏰ Время жизни: {ttl}\n"
+                f"📅 Создан: {created_at[:19]}")
+
+        # Создаем клавиатуру для быстрого доступа с user_id     ТЕКУЩЕГО пользователя
+        reply_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 Статус",      callback_data=f"status:{user_id}")],
+            [InlineKeyboardButton("🔄 Пересоздать", callback_data=f"launch:{user_id}")],
+            [InlineKeyboardButton("⏹️ Остановить", callback_data=f"stop:{user_id}")]
+        ])
+
+        results = [
+            InlineQueryResultArticle(
+                id='1',
+                title="🐳 Информация о вашем контейнере",
+                description=f"{image_name} | {shell} | {config_name}",
+                input_message_content=InputTextMessageContent(
+                    text,
+                    parse_mode=None
+                ),
+                reply_markup=reply_markup
+            )
+        ]
+
+        await update.inline_query.answer(results)
+
+    def cleanup_old_sessions(self):
+        """Очищает устаревшие сессии из Redis"""
+        try:
+            # Получаем все ключи сессий
+            session_keys = self.redis.keys("session:*")
+            logger.info(f"Found {len(session_keys)} sessions to check")
+
+            for key in session_keys:
+                try:
+                    session_data = self.redis.get(key)
+                    if session_data:
+                        session = json.loads(session_data)
+                        container_id = session.get('container_id')
+                        if container_id:
+                            # Проверяем существование контейнера
+                            container = self.docker_client.containers.get(container_id)
+                            if container.status != 'running':
+                                # Удаляем сессию неработающего контейнера
+                                self.redis.delete(key)
+                                logger.info(f"Removed session for non-running container: {container_id}")
+                except docker.errors.NotFound:
+                    # Контейнер не найден - удаляем сессию
+                    self.redis.delete(key)
+                    logger.info(f"Removed session for non-existent container")
+                except Exception as e:
+                        logger.error(f"Error checking session {key}: {e}")
+        except Exception as e:
+            logger.error(f"Error cleaning up old sessions: {e}")
+
+
+def main():
+    """Запуск бота"""
+    try:
+        # Получаем токен из переменной окружения
+        token = os.getenv("TELEGRAM_BOT_TOKEN")
+        if not token:
+            print("❌ Ошибка: TELEGRAM_BOT_TOKEN не установлен")
+            print("Установите токен: export TELEGRAM_BOT_TOKEN='ваш_токен'")
+            return
+
+        print("✅ Токен получен, запуск бота...")
+
+        bot = TerminalBot()
+        application = Application.builder().token(token).build()
+
+        # Универсальный обработчик callback
+        application.add_handler(CallbackQueryHandler(bot.handle_callback))
+
+        # ConversationHandler для кастомных образов и добавления пользователей
+        conv_handler = ConversationHandler(
+            entry_points=[
+                CallbackQueryHandler(bot.custom_image_input, pattern="^custom:"),
+                CallbackQueryHandler(bot.add_user_prompt, pattern="^add_user:")
+            ],
+            states={
+                CUSTOM_IMAGE: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, bot.process_custom_image)
+                ],
+                CONFIRMING_USER: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, bot.receive_user_id)
+                ]
+            },
+            fallbacks=[CommandHandler("cancel", bot.cancel)],
+            per_message=False
+        )
+
+        # Регистрируем обработчики
+        application.add_handler(CommandHandler("start", bot.start))
+        application.add_handler(CommandHandler("container", bot.container_command))
+        application.add_handler(CommandHandler("cancel", bot.cancel_command))
+        application.add_handler(CommandHandler("docker", bot.docker_command))
+        application.add_handler(CommandHandler("nohup", bot.nohup_command))
+        application.add_handler(CommandHandler("processes", bot.background_processes))
+        application.add_handler(CommandHandler("kill", bot.kill_process))
+        # ConversationHandler
+        application.add_handler(conv_handler)
+
+        # Инлайн-обработчик
+        application.add_handler(InlineQueryHandler(bot.inline_query))
+
+        # Обработчик текстовых сообщений (команды в терминал) - только в личных чатах
+        application.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+            bot.execute_command
+        ))
+
+        print("🚀 Бот запущен и готов к работе...")
+        print("Нажмите Ctrl+C для остановки")
+
+        # Запускаем бота
+        application.run_polling()
+
+    except Exception as e:
+        print(f"❌ Ошибка при запуске бота: {e}")
+        logger.error(f"Bot startup error: {e}")
+
+if __name__ == "__main__":
+    main()
