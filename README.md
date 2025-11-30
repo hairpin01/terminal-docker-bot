@@ -1,4 +1,11 @@
-# Terminal Docker Bot
+
+
+# Terminal Docker Bot <div align="center">
+
+<img src="img/main_img.png" alt="Bot Preview" width="300"/>
+
+</div>
+
 [Telegram bot](https://t.me/docker_terminal_bot)  [Telegram](https://t.me/Hairpin00)
  
 ## 🚀 Установка
