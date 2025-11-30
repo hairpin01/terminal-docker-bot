@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import psutil
 
-# Настройка логирования
+
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
@@ -42,7 +42,7 @@ class TerminalBot:
             self.docker_client = docker.from_env()
             logger.info("Docker client initialized successfully")
             self.cleanup_old_containers()
-            self.cleanup_old_sessions()  # Добавьте эту строку
+            self.cleanup_old_sessions()  
             self.setup_signal_handlers()
         except Exception as e:
             logger.error(f"Failed to initialize Docker client: {e}")
@@ -51,12 +51,12 @@ class TerminalBot:
         self.redis = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 
         # Администраторы
-        self.admin_ids = [6020965582]  # Замените на ваши ID
+        self.admin_ids = [YOU_ADMIN_ID]  # Замените на ваши ID
 
         # Подтвержденные пользователи
         self.init_confirmed_users()
 
-        # Правильные имена образов Docker
+       
         self.available_images = {
             "alpine:latest": "Alpine Linux",
             "ubuntu:latest": "Ubuntu",
@@ -120,7 +120,7 @@ class TerminalBot:
         # Очереди команд для каждого пользователя
         self.command_queues = {}
         self.command_workers = {}
-        self.active_commands = {}  # Для отслеживания активных команд
+        self.active_commands = {}  
 
         # Пул потоков для выполнения команд
         self.thread_pool = ThreadPoolExecutor(max_workers=10)
@@ -252,14 +252,14 @@ class TerminalBot:
             self.redis.delete(f"session:{user_id}")
             return
 
-        # Создаем уникальное имя для лог-файла
+        
         import time
         log_file = f"/tmp/nohup_{user_id}_{int(time.time())}.log"
 
-        # Формируем команду для выполнения в фоне
+        
         background_command = f"nohup {shell} -c \"{command}\" > {log_file} 2>&1 & echo $! > /tmp/last_pid_{user_id}.txt"
 
-        # Выполняем команду запуска в фоне
+        
         loop = asyncio.get_event_loop()
         try:
             result = await loop.run_in_executor(
