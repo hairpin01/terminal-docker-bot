@@ -11,7 +11,7 @@
 ## 🚀 Установка
 ```bash
 # Клонирование репозитория
-git clone https://github.com/your-username/terminal-docker-bot.git
+git clone https://github.com/hairpin00/terminal-docker-bot.git
 cd terminal-docker-bot
 ```
 ```bash
