@@ -36,7 +36,6 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-
 SELECTING_IMAGE, SELECTING_SHELL, SELECTING_TTL, SELECTING_CONFIG, CUSTOM_IMAGE, CONFIRMING_USER, UPLOAD_FILE, DOWNLOAD_FILE = range(8)
 
 class TerminalBot:
@@ -56,7 +55,7 @@ class TerminalBot:
         self.cleanup_old_sessions()
 
         # Администраторы
-        self.admin_ids = [6020965582]  # Замените на ваши ID
+        self.admin_ids = []  # Замените на ваши ID
 
         # Подтвержденные пользователи
         self.init_confirmed_users()
@@ -118,7 +117,7 @@ class TerminalBot:
             "minimal": {
                 "name": "Базовая",
                 "cpu_period": 100000,
-                "cpu_quota": 30000,  # 30% CPU
+                "cpu_quota": 30000,  # 25% CPU
                 "mem_limit": "246m",
                 "pids_limit": 25,
                 "description": "246MB RAM, 30% CPU"
@@ -361,7 +360,7 @@ class TerminalBot:
 
 
     async def nohup_command(self, update: Update, context: CallbackContext):
-        """Выполняет команду в фоне с проверкой для тестовых контейнеров"""
+        """Асинхронно выполняет команду в фоне с проверкой для тестовых контейнеров"""
         user_id = update.effective_user.id
 
         # Проверяем, есть ли активная сессия
@@ -421,9 +420,21 @@ class TerminalBot:
         # Формируем команду для выполнения в фоне
         background_command = f"nohup {shell} -c \"{command}\" > {log_file} 2>&1 & echo $! > /tmp/last_pid_{user_id}.txt"
 
-        # Выполняем команду запуска в фоне
-        loop = asyncio.get_event_loop()
+        # Отправляем сообщение о запуске
+        status_msg = await update.message.reply_text("⏳ Запускаю команду в фоне...")
+
+        # Запускаем асинхронное выполнение
+        asyncio.create_task(
+            self._execute_nohup_command(
+                user_id, container, background_command, command, log_file, status_msg
+            )
+        )
+
+    async def _execute_nohup_command(self, user_id, container, background_command, original_command, log_file, status_msg):
+        """Асинхронно выполняет nohup команду"""
         try:
+            # Выполняем команду запуска в фоне
+            loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
                 self.thread_pool,
                 self._run_command_sync,
@@ -444,9 +455,9 @@ class TerminalBot:
 
                 pid = pid_result[0].strip() if pid_result[0] else "неизвестен"
 
-                await update.message.reply_text(
+                await status_msg.edit_text(
                     f"✅ Команда запущена в фоне!\n\n"
-                    f"📝 Команда: `{command}`\n"
+                    f"📝 Команда: `{original_command}`\n"
                     f"🆔 PID: `{pid}`\n"
                     f"📁 Логи: `{log_file}`\n\n"
                     f"💡 Для проверки процессов используйте: `ps aux | grep {pid}`\n"
@@ -454,14 +465,20 @@ class TerminalBot:
                     parse_mode='Markdown'
                 )
             else:
-                await update.message.reply_text(
+                await status_msg.edit_text(
                     f"❌ Ошибка при запуске команды в фоне:\n```\n{output}\n```",
                     parse_mode='Markdown'
                 )
 
         except Exception as e:
             logger.error(f"Error executing nohup command for user {user_id}: {e}")
-            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+            try:
+                await status_msg.edit_text(f"❌ Ошибка: {str(e)}")
+            except:
+                pass
+
+
+
 
     async def show_token_exhausted_menu(self, update: Update, context: CallbackContext):
         """Показывает меню когда токены закончились"""
@@ -508,7 +525,7 @@ class TerminalBot:
             tokens_text = f"{tokens} 🎫"
 
             # Показываем когда пополнятся токены (например, +10 в день)
-            next_refill = "завтра"  # Можно реализовать логику пополнения, но мне лень щас
+            next_refill = "завтра"  # Можно реализовать логику пополнения
 
         keyboard = [
             [InlineKeyboardButton("🔙 Назад", callback_data=f"main:{user_id}")]
@@ -664,19 +681,45 @@ class TerminalBot:
         user_id = update.effective_user.id
         await self.show_main_menu(update, context, user_id)
 
-
     async def start_command_worker(self, user_id):
         """Запускает воркер для обработки команд пользователя"""
         if user_id in self.command_workers:
-            self.command_workers[user_id].cancel()
+            return
 
-        if user_id not in self.command_queues:
-            self.command_queues[user_id] = asyncio.Queue()
+        async def worker():
+            queue = self.command_queues.get(user_id)
+            if not queue:
+                return
 
-        # Создаем задачу для обработки команд
-        self.command_workers[user_id] = asyncio.create_task(
-            self._command_worker(user_id)
-        )
+            while True:
+                try:
+                    # Получаем команду из очереди с таймаутом
+                    try:
+                        update, context, command, status_msg = await asyncio.wait_for(
+                            queue.get(), timeout=300.0  # 5 минут таймаут
+                        )
+                    except asyncio.TimeoutError:
+                        # Если очередь пуста 5 минут, завершаем воркер
+                        break
+
+                    # Выполняем команду
+                    await self._execute_single_command(update, context, command, status_msg, user_id)
+
+                    # Помечаем задачу как выполненную
+                    queue.task_done()
+
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Error in command worker for user {user_id}: {e}")
+                    try:
+                        await status_msg.edit_text(f"❌ Ошибка при выполнении команды: {str(e)}")
+                    except:
+                        pass
+
+        # Запускаем воркер
+        worker_task = asyncio.create_task(worker())
+        self.command_workers[user_id] = worker_task
 
     async def _command_worker(self, user_id):
         """Воркер для обработки команд пользователя"""
@@ -685,7 +728,7 @@ class TerminalBot:
                 # Ждем команду из очереди
                 command_data = await self.command_queues[user_id].get()
 
-                if command_data is None:  # Сигнал остановки (сигнал "идинахуй")
+                if command_data is None:  # Сигнал остановки
                     break
 
                 update, context, command, status_msg = command_data
@@ -2197,7 +2240,7 @@ class TerminalBot:
             await query.edit_message_text("❌ У вас нет доступа")
             return
 
-      
+        # Добавляем пользователя в подтвержденные
         self.add_confirmed_user(user_id_to_add)
 
         keyboard = [
@@ -2228,9 +2271,10 @@ class TerminalBot:
 
     async def inline_query(self, update: Update, context: CallbackContext):
         """Обработчик инлайн-запросов - показывает информацию о контейнере пользователя"""
-        user_id = update.inline_query.from_user.id
+        query = update.inline_query
+        user_id = query.from_user.id  # user_id того, кто делает инлайн-запрос
 
-        # Проверяем сессию текущего пользователя (того, кто сделал инлайн-запрос)
+        # Проверяем сессию пользователя, который сделал запрос
         session_info = self.get_session_info(user_id)
         if not session_info:
             results = [
@@ -2269,6 +2313,7 @@ class TerminalBot:
             # Проверяем, что контейнер действительно существует и работает
             container = self.docker_client.containers.get(container_id)
             if container.status != 'running':
+                # Контейнер существует, но не запущен - удаляем сессию
                 session_key = f"session:{user_id}"
                 self.redis.delete(session_key)
                 results = [
@@ -2293,7 +2338,7 @@ class TerminalBot:
                     title="❌ Контейнер не найден",
                     description="Создайте новый контейнер через /container",
                     input_message_content=InputTextMessageContent(
-                        "❌ Ваш контейнер не найден. Используйте /   container для создания нового."
+                        "❌ Ваш контейнер не найден. Используйте /container для создания нового."
                     )
                 )
             ]
@@ -2314,15 +2359,18 @@ class TerminalBot:
             await update.inline_query.answer(results)
             return
 
-        # Если все проверки пройдены, показываем информацию о контейнере ТЕКУЩЕГО пользователя
+
         image_name = self.available_images.get(session_info.get('image', ''), session_info.get('image', 'Кастомный'))
         shell = session_info.get('shell', 'bash')
         config_name = session_info.get('config_name', 'Минимальная')
         network = "включена" if session_info.get('network', True) else "выключена"
         ttl = session_info.get('ttl_display', 'Неизвестно')
         created_at = session_info.get('created_at', 'Неизвестно')
+        is_test = session_info.get('is_test', False)
 
-        text = (f"🐳 Ваш контейнер:\n"
+        status_text = "🧪 Тестовый" if is_test else "🐳 Обычный"
+
+        text = (f"{status_text} контейнер:\n"
                 f"🐧 Образ: {image_name}\n"
                 f"💻 Шелл: {shell}\n"
                 f"⚙️ Конфигурация: {config_name}\n"
@@ -2330,9 +2378,8 @@ class TerminalBot:
                 f"⏰ Время жизни: {ttl}\n"
                 f"📅 Создан: {created_at[:19]}")
 
-        # Создаем клавиатуру для быстрого доступа с user_id     ТЕКУЩЕГО пользователя
         reply_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📊 Статус",      callback_data=f"status:{user_id}")],
+            [InlineKeyboardButton("📊 Статус", callback_data=f"status:{user_id}")],
             [InlineKeyboardButton("🔄 Пересоздать", callback_data=f"launch:{user_id}")],
             [InlineKeyboardButton("⏹️ Остановить", callback_data=f"stop:{user_id}")]
         ])
@@ -2340,8 +2387,8 @@ class TerminalBot:
         results = [
             InlineQueryResultArticle(
                 id='1',
-                title="🐳 Информация о вашем контейнере",
-                description=f"{image_name} | {shell} | {config_name}",
+                title=f"{status_text} контейнер: {image_name}",
+                description=f"{shell} | {config_name} | {ttl}",
                 input_message_content=InputTextMessageContent(
                     text,
                     parse_mode=None
@@ -2365,7 +2412,7 @@ class TerminalBot:
 def main():
     """Запуск бота"""
     try:
-        # Получаем токен из переменной окружения (если есть) 
+        # Получаем токен из переменной окружения
         token = os.getenv("TELEGRAM_BOT_TOKEN")
         if not token:
             print("❌ Ошибка: TELEGRAM_BOT_TOKEN не установлен")
@@ -2379,7 +2426,7 @@ def main():
 
         application = Application.builder().token(token).build()
 
-      
+        # Универсальный обработчик callback
         application.add_handler(CallbackQueryHandler(bot.handle_callback))
 
         conv_handler = ConversationHandler(
@@ -2409,7 +2456,7 @@ def main():
         application.add_handler(CommandHandler("kill", bot.kill_process))
         application.add_handler(CommandHandler("download", bot.handle_download))
 
-        # Обработчик загрузки файлов
+        # Обработчик загрузки файлов (просто документы в личных чатах)
         application.add_handler(MessageHandler(
             filters.Document.ALL & filters.ChatType.PRIVATE,
             bot.handle_upload
@@ -2421,7 +2468,7 @@ def main():
         # Инлайн-обработчик
         application.add_handler(InlineQueryHandler(bot.inline_query))
 
-        # Обработчик текстовых сообщений 
+        # Обработчик текстовых сообщений (команды в терминал)
         application.add_handler(MessageHandler(
             filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
             bot.execute_command
