@@ -1,3 +1,5 @@
 python-telegram-bot
 docker
 psutil
+Flask==3.0.0
+flask-cors==4.0.0
