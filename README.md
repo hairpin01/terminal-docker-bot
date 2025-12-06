@@ -2,7 +2,7 @@
 
 # Terminal Docker Bot <div align="center">
 
-<img src="img/main_img.png" alt="Bot Preview" width="300"/>
+<img src="img/art-2.jpg" alt="Bot Preview" width="300"/>
 
 </div>
 
